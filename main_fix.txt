@@ -1,0 +1,138 @@
+"""
+IFC → STEP Konverter Backend
+FastAPI + IfcOpenShell + pythonocc-core
+
+Lokal starten:
+  uvicorn main:app --reload
+
+Deploy auf Railway/Render:
+  Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
+
+import os
+import tempfile
+import traceback
+from pathlib import Path
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+app = FastAPI(title="IFC → STEP Konverter", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In Produktion: eigene Lovable-Domain eintragen
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Abhängigkeiten prüfen ────────────────────────────────────────────────────
+try:
+    import ifcopenshell
+    import ifcopenshell.geom
+    HAS_IFC = True
+except ImportError:
+    HAS_IFC = False
+
+try:
+    from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
+    from OCC.Core.Interface import Interface_Static
+    from OCC.Core.IFSelect import IFSelect_RetDone
+    HAS_OCC = True
+except ImportError:
+    HAS_OCC = False
+
+SKIP_TYPES = {
+    "IfcSpace", "IfcOpeningElement",
+    "IfcAnnotation", "IfcGrid", "IfcVirtualElement",
+}
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "ifcopenshell": HAS_IFC,
+        "pythonocc": HAS_OCC,
+        "message": "IFC → STEP Konverter API bereit",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/convert")
+async def convert(file: UploadFile = File(...)):
+    # Dateityp prüfen
+    if not file.filename.lower().endswith((".ifc", ".ifczip")):
+        raise HTTPException(400, "Nur .ifc oder .ifczip Dateien erlaubt.")
+
+    if not HAS_IFC:
+        raise HTTPException(500, "ifcopenshell nicht installiert.")
+    if not HAS_OCC:
+        raise HTTPException(500, "pythonocc-core nicht installiert.")
+
+    # Temporäre Dateien
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path  = os.path.join(tmpdir, file.filename)
+        out_name = Path(file.filename).stem + ".stp"
+        out_path = os.path.join(tmpdir, out_name)
+
+        # Hochgeladene Datei speichern
+        content = await file.read()
+        with open(in_path, "wb") as f:
+            f.write(content)
+
+        # Konvertierung
+        try:
+            model = ifcopenshell.open(in_path)
+
+            settings = ifcopenshell.geom.settings()
+            settings.set(settings.USE_PYTHON_OPENCASCADE, True)
+            for attr in ("SEW_SHELLS", "WELD_VERTICES"):
+                if hasattr(settings, attr):
+                    settings.set(getattr(settings, attr), True)
+
+            writer = STEPControl_Writer()
+            Interface_Static.SetCVal("write.step.schema", "AP214")
+
+            ok = 0
+            for product in model.by_type("IfcProduct"):
+                if product.is_a() in SKIP_TYPES:
+                    continue
+                if not product.Representation:
+                    continue
+                try:
+                    shape = ifcopenshell.geom.create_shape(settings, product)
+                    writer.Transfer(shape.geometry, STEPControl_AsIs)
+                    ok += 1
+                except Exception:
+                    pass
+
+            if ok == 0:
+                raise HTTPException(422, "Keine Geometrie gefunden in der IFC-Datei.")
+
+            result = writer.Write(out_path)
+            if result != IFSelect_RetDone:
+                raise HTTPException(500, "STEP-Datei konnte nicht geschrieben werden.")
+
+            # Datei zurückschicken
+            return FileResponse(
+                path=out_path,
+                filename=out_name,
+                media_type="application/octet-stream",
+                headers={
+                    "X-Converted-Elements": str(ok),
+                    "Access-Control-Expose-Headers": "X-Converted-Elements",
+                },
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(500, f"Konvertierungsfehler: {str(e)}")
